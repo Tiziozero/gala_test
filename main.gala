@@ -1,0 +1,166 @@
+// main.gala
+import "core.gala";
+import "net.gala";
+import "mem.gala";
+import "cfunctions.gala";
+import "stb_image.gala";
+
+struct VoidSlice { p: rawptr, size: u64 }
+fn slice_from_ptr(p: rawptr, size: u64): []void {
+    return transmute([]void)(VoidSlice{p, size});
+}
+
+fn stringcmp(a: string, b: string): bool {
+    if len(a) != len(b) {
+        return false;
+    }
+    i := 0;
+    while i < len(a) {
+        if a[i] != b[i] { return false; }
+        i += 1;
+    }
+    return true;
+}
+
+struct Request {
+}
+struct ResponseWriter {
+}
+struct HttpServer {
+    paths: []string,
+    handlers: []fn(r: Request, w: ResponseWriter),
+}
+
+// to "\n"
+fn http_request_next_line(s: string): string {
+    i := 0;
+    while i < len(s) {
+        if s[i] == 13 && i + 1 < len(s) && s[i+1] == 10 {
+            return transmute(string)s[:i];
+        }
+        i += 1;
+    }
+    return "";
+}
+// to " "
+fn http_request_header_next(s: ^string): string {
+    i := 0;
+
+    while i < len(s^) {
+        c := s^[i];
+
+        if c == 32 || c == 10 {
+            r := transmute(string)(s^[:i]);
+            s^ = transmute(string)(s^[i+1:]);
+            return r;
+        }
+
+        if c == 13 {
+            if i + 1 >= len(s^) {
+                break;
+            }
+
+            if s^[i+1] == 10 {
+                r := transmute(string)(s^[:i]);
+                s^ = transmute(string)(s^[i+2:]);
+                return r;
+            }
+        }
+
+        i += 1;
+    }
+    // else no terminator so just return it
+
+    r := transmute(string)(s^[:i]);
+    s^ = transmute(string)(s^[i+1:]);
+    return r;
+}
+fn main(): i32 {
+    count := 0;
+    all_paths := [1024]string{};
+    all_handlers := [1024]fn(r: Request, w: ResponseWriter){};
+    listener := tcp_listen(1234, 10);
+    if listener.fd < 0 {
+        println("failed to listen in tcp_listen.");
+        return -1;
+    }
+    all_paths[0] = "/";
+    all_handlers[0] = fn(r: Request, w: ResponseWriter) {
+        println("Home called.");
+    };
+    count += 1;
+    
+    data := [1024]byte{};
+    println("Starting listening");
+    while true {
+        client := tcp_accept(listener);
+        n := tcp_recv(client, data[:]);
+        if n < 0 {
+            println("failed to receive from client.");
+            return -1;
+        }
+        request := transmute(string)data[:n];
+        for c in request {
+            if c == 10 {
+                printf(&("\\n")[0]);
+                println("");
+            } else if c == 13 {
+                printf(&("\\r")[0]);
+            } else {
+                printf(&("%c")[0], c);
+            }
+        }
+
+        header := http_request_next_line(request);
+        if len(header) == 0 {
+            println("Invalid header for request:", request);
+            return -1;
+        }
+        rest := header;
+
+        request_type := http_request_header_next(&rest);
+        if len(request_type) == 0 {
+            println("Invalid header (request type) for request:", request);
+            return -1;
+        }
+
+        path := http_request_header_next(&rest);
+        if len(path) == 0 {
+            println("Invalid header (path) for request:", request);
+            return -1;
+        }
+
+        println(rest, len(rest));
+        version := http_request_header_next(&rest);
+        if len(version) == 0 {
+            println("Invalid header (version) for request:", request);
+            return -1;
+        }
+
+        println("Request type:      ", request_type, len(request_type));
+        println("Request path:      ", path, len(path));
+        println("Request version:   ", version, len(version));
+        // response
+        arena := arena_make(1024*1024);
+
+        i := 0;
+        handled := false;
+        while i < count && !handled {
+            if stringcmp(path, all_paths[i]) {
+                all_handlers[i](Request{}, ResponseWriter{});
+                handled = true;
+                break;
+            }
+            i+= 1;
+        }
+        if !handled { println("no handlers for path:", path); }
+
+        arena_destroy(&arena);
+        tcp_shutdown(client, SHUT_RDWR);
+        tcp_close(client);
+
+    }
+    tcp_close(listener);
+
+    return 0;
+}
