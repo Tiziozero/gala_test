@@ -6,6 +6,7 @@ import "core/cfunctions.gala";
 import "core/map.gala";
 import "core/io.gala";
 import "./http_response.gala";
+import "core/json.gala";
 
 
 struct VoidSlice { p: rawptr, size: u64 }
@@ -101,26 +102,42 @@ fn main(): i32 {
         } else {
             // println("from", v);
         }
-        println(transmute(string)r.body);
+        if map_get_m(r.headers, "Content-Type", &v) {
+            if stringcmp(v, "application/json") {
+                println("JSON:", transmute(string)r.body);
+                j := JsonValue{0, "", 0, 0};
+                if !json_parse(transmute(string)r.body, &j, r.a) {
+                    println("Failed to parse json.");
+                    out := make_http_response( ("invalid json")[:],
+                        status = 400, a = r.a, content_type = "text/html; charset=utf-8");
+                    return out;
+                }
+                if !map_get_m(j.obj^, "value", &j) {
+                    println("failed to get value");
+                    out := make_http_response( ("missing vlaue")[:],
+                        status = 400, a = r.a, content_type = "text/html; charset=utf-8");
+                    return out;
+                }
+                println("Value:", j.num);
+            }
+        }
         out := make_http_response(
             ("<!DOCTYPE html><html><head></head><body><h1>Hello, World!</h1><img src=\"/i\" /></body></html>")[:],
             status = 200,
-            a = base_allocator,
+            a = r.a,
             content_type = "text/html; charset=utf-8");
         return out;
     };
     all_handlers[1] = fn(r: Request, w: ResponseWriter): []byte {
-        a := arena_make(1024*1024*16);
-        img := open_file("./apple.png", arena_allocator(&a));
+        img := open_file("./apple.png", r.a);
         if len(img) == 0 {
             println("Failed to open favicon");
             out := make_http_response( ("failed to open favicon")[:], status = 500,
-             a = arena_allocator(&a), content_type = "text/plain; charset=utf-8");
+             a = r.a, content_type = "text/plain; charset=utf-8");
             return out;
         }
         out := make_http_response( img, status = 200,
-                a = arena_allocator(&a), content_type = "image/png");
-        arena_destroy(&a);
+                a = r.a, content_type = "image/png");
         return out;
     };
     count += 2;
