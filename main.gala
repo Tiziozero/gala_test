@@ -1,9 +1,12 @@
 // main.gala
-import "core.gala";
-import "net.gala";
-import "mem.gala";
-import "cfunctions.gala";
-import "stb_image.gala";
+import "core/core.gala";
+import "core/net.gala";
+import "core/mem.gala";
+import "core/cfunctions.gala";
+import "core/map.gala";
+import "core/io.gala";
+import "./http_response.gala";
+
 
 struct VoidSlice { p: rawptr, size: u64 }
 fn slice_from_ptr(p: rawptr, size: u64): []void {
@@ -23,6 +26,11 @@ fn stringcmp(a: string, b: string): bool {
 }
 
 struct Request {
+    headers: Map(string, string),
+    path: string,
+    kind: string,
+    body: []byte,
+    a: Allocator,
 }
 struct ResponseWriter {
 }
@@ -31,67 +39,95 @@ struct HttpServer {
     handlers: []fn(r: Request, w: ResponseWriter),
 }
 
-// to "\n"
-fn http_request_next_line(s: string): string {
+// Returns everything before the first `sep` and moves `s` past it.
+// If there is no `sep`, returns the whole rest and leaves `s` empty.
+fn http_take_until(s: ^string, sep: byte): string {
     i := 0;
-    while i < len(s) {
-        if s[i] == 13 && i + 1 < len(s) && s[i+1] == 10 {
-            return transmute(string)s[:i];
-        }
-        i += 1;
-    }
-    return "";
-}
-// to " "
-fn http_request_header_next(s: ^string): string {
-    i := 0;
-
     while i < len(s^) {
-        c := s^[i];
-
-        if c == 32 || c == 10 {
+        if s^[i] == sep {
             r := transmute(string)(s^[:i]);
             s^ = transmute(string)(s^[i+1:]);
             return r;
         }
-
-        if c == 13 {
-            if i + 1 >= len(s^) {
-                break;
-            }
-
-            if s^[i+1] == 10 {
-                r := transmute(string)(s^[:i]);
-                s^ = transmute(string)(s^[i+2:]);
-                return r;
-            }
-        }
-
         i += 1;
     }
-    // else no terminator so just return it
-
     r := transmute(string)(s^[:i]);
-    s^ = transmute(string)(s^[i+1:]);
+    s^ = transmute(string)(s^[i:]);
     return r;
+}
+fn http_request_next_line(s: ^string): string {
+    i := 0;
+    while i < len(s^) - 1 { // "\r\n". "- 1" stops the "s^[i+1]" from overflowing
+        if s^[i] == 13 && i + 1 < len(s^) && s^[i+1] == 10 {
+            r := transmute(string)s^[:i];
+            s^ = transmute(string)(s^[i+2:]); // skip \r and \n
+            return r;
+        }
+        i += 1;
+    }
+    return ""; // no line
+}
+
+struct parsed_header { k, v: string }
+fn http_parse_header(s: string): parsed_header {
+    i := 0;
+    l := len(s);
+    while i < l {
+        if s[i] == (":")[0] {
+            s1 := transmute(string)s[:i];
+            // find first non-whitespace character
+            s2 := transmute(string)s[i+2:];
+            return parsed_header{s1, s2};
+        }
+        i += 1;
+    }
+    return parsed_header{"", ""};
 }
 fn main(): i32 {
     count := 0;
     all_paths := [1024]string{};
-    all_handlers := [1024]fn(r: Request, w: ResponseWriter){};
+    all_handlers := [1024]fn(r: Request, w: ResponseWriter): []byte{};
     listener := tcp_listen(1234, 10);
     if listener.fd < 0 {
         println("failed to listen in tcp_listen.");
         return -1;
     }
     all_paths[0] = "/";
-    all_handlers[0] = fn(r: Request, w: ResponseWriter) {
-        println("Home called.");
+    all_paths[1] = "/i";
+    all_handlers[0] = fn(r: Request, w: ResponseWriter): []byte {
+        v := "";
+        if !map_get_m(r.headers, "User-Agent", &v) {
+            println("Failed to get user agent.");
+        } else {
+            // println("from", v);
+        }
+        println(transmute(string)r.body);
+        out := make_http_response(
+            ("<!DOCTYPE html><html><head></head><body><h1>Hello, World!</h1><img src=\"/i\" /></body></html>")[:],
+            status = 200,
+            a = base_allocator,
+            content_type = "text/html; charset=utf-8");
+        return out;
     };
-    count += 1;
+    all_handlers[1] = fn(r: Request, w: ResponseWriter): []byte {
+        a := arena_make(1024*1024*16);
+        img := open_file("./apple.png", arena_allocator(&a));
+        if len(img) == 0 {
+            println("Failed to open favicon");
+            out := make_http_response( ("failed to open favicon")[:], status = 500,
+             a = arena_allocator(&a), content_type = "text/plain; charset=utf-8");
+            return out;
+        }
+        out := make_http_response( img, status = 200,
+                a = arena_allocator(&a), content_type = "image/png");
+        arena_destroy(&a);
+        return out;
+    };
+    count += 2;
     
-    data := [1024]byte{};
+    data := [4096]byte{};
     println("Starting listening");
+    make_http_response(("")[:], status=123);
     while true {
         client := tcp_accept(listener);
         n := tcp_recv(client, data[:]);
@@ -100,61 +136,66 @@ fn main(): i32 {
             return -1;
         }
         request := transmute(string)data[:n];
-        for c in request {
-            if c == 10 {
-                printf(&("\\n")[0]);
-                println("");
-            } else if c == 13 {
-                printf(&("\\r")[0]);
-            } else {
-                printf(&("%c")[0], c);
-            }
-        }
+        whole_request := request;
 
-        header := http_request_next_line(request);
+        header := http_request_next_line(&request);
         if len(header) == 0 {
-            println("Invalid header for request:", request);
+            println("Invalid header for request:", whole_request);
             return -1;
         }
         rest := header;
 
-        request_type := http_request_header_next(&rest);
+        request_type := http_take_until(&rest, 32);
         if len(request_type) == 0 {
-            println("Invalid header (request type) for request:", request);
+            println("Invalid header (request type) for request:", whole_request);
             return -1;
         }
 
-        path := http_request_header_next(&rest);
+        path := http_take_until(&rest, 32);
         if len(path) == 0 {
-            println("Invalid header (path) for request:", request);
+            println("Invalid header (path) for request:", whole_request);
             return -1;
         }
 
-        println(rest, len(rest));
-        version := http_request_header_next(&rest);
+        version := http_take_until(&rest, 32);
         if len(version) == 0 {
-            println("Invalid header (version) for request:", request);
+            println("Invalid header (version) for request:", whole_request);
             return -1;
         }
 
-        println("Request type:      ", request_type, len(request_type));
-        println("Request path:      ", path, len(path));
-        println("Request version:   ", version, len(version));
-        // response
-        arena := arena_make(1024*1024);
+        // println("Request type:      ", request_type, len(request_type));
+        // println("Request path:      ", path, len(path));
+        // println("Request version:   ", version, len(version));
+
+        // request arena
+        arena := arena_make(1024*1024*16);
+        headers := map_make(128, "", "", hash_str, eq_str, arena_allocator(&arena));
+        while true {
+            header1 := http_request_next_line(&request);
+            if len(header1) == 0 { break; }
+            parsed := http_parse_header(header1);
+            map_put(&headers, parsed.k, parsed.v);
+        }
+        body := request[:]; // should be rest as last line was \r\n
+
 
         i := 0;
         handled := false;
         while i < count && !handled {
             if stringcmp(path, all_paths[i]) {
-                all_handlers[i](Request{}, ResponseWriter{});
+                out := all_handlers[i](Request{ headers=headers, kind=request_type, body=body,
+                    path=path, a=arena_allocator(&arena) }, ResponseWriter{});
                 handled = true;
+                tcp_send(client, out);
                 break;
             }
             i+= 1;
         }
-        if !handled { println("no handlers for path:", path); }
-
+        if !handled {
+            println("no handlers for path:", path);
+            r := make_http_response(("invalid request")[:], status=404);
+            tcp_send(client, r);
+        }
         arena_destroy(&arena);
         tcp_shutdown(client, SHUT_RDWR);
         tcp_close(client);
