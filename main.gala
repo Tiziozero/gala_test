@@ -1,30 +1,41 @@
 // main.gala
+
 import "core/core.gala";
 import "core/net.gala";
 import "core/mem.gala";
 import "core/cfunctions.gala";
 import "core/map.gala";
 import "core/io.gala";
-import "./http_response.gala";
 import "core/json.gala";
+import "./http_response.gala";
 
 
-struct VoidSlice { p: rawptr, size: u64 }
+struct VoidSlice {
+    p: rawptr,
+    size: u64,
+}
+
 fn slice_from_ptr(p: rawptr, size: u64): []void {
     return transmute([]void)(VoidSlice{p, size});
 }
+
 
 fn stringcmp(a: string, b: string): bool {
     if len(a) != len(b) {
         return false;
     }
+
     i := 0;
     while i < len(a) {
-        if a[i] != b[i] { return false; }
+        if a[i] != b[i] {
+            return false;
+        }
         i += 1;
     }
+
     return true;
 }
+
 
 struct Request {
     headers: Map(string, string),
@@ -33,191 +44,305 @@ struct Request {
     body: []byte,
     a: Allocator,
 }
+
 struct ResponseWriter {
 }
+
 struct HttpServer {
     paths: []string,
-    handlers: []fn(r: Request, w: ResponseWriter),
+    handlers: []fn(r: Request, w: ResponseWriter): []byte,
 }
 
-// Returns everything before the first `sep` and moves `s` past it.
-// If there is no `sep`, returns the whole rest and leaves `s` empty.
+
+struct ParsedHeader {
+    k, v: string,
+}
+
+
+// Returns everything before the first separator and advances the string.
+// If no separator exists, returns the entire string and leaves it empty.
 fn http_take_until(s: ^string, sep: byte): string {
     i := 0;
+
     while i < len(s^) {
         if s^[i] == sep {
-            r := transmute(string)(s^[:i]);
-            s^ = transmute(string)(s^[i+1:]);
-            return r;
+            result := transmute(string)(s^[:i]);
+            s^ = transmute(string)(s^[i + 1:]);
+            return result;
         }
+
         i += 1;
     }
-    r := transmute(string)(s^[:i]);
+
+    result := transmute(string)(s^[:i]);
     s^ = transmute(string)(s^[i:]);
-    return r;
-}
-fn http_request_next_line(s: ^string): string {
-    i := 0;
-    while i < len(s^) - 1 { // "\r\n". "- 1" stops the "s^[i+1]" from overflowing
-        if s^[i] == 13 && i + 1 < len(s^) && s^[i+1] == 10 {
-            r := transmute(string)s^[:i];
-            s^ = transmute(string)(s^[i+2:]); // skip \r and \n
-            return r;
-        }
-        i += 1;
-    }
-    return ""; // no line
+
+    return result;
 }
 
-struct parsed_header { k, v: string }
-fn http_parse_header(s: string): parsed_header {
+
+// Returns the next CRLF-terminated line and advances past it.
+// Returns an empty string when no complete line is available.
+fn http_request_next_line(s: ^string): string {
     i := 0;
-    l := len(s);
-    while i < l {
-        if s[i] == (":")[0] {
-            s1 := transmute(string)s[:i];
-            // find first non-whitespace character
-            s2 := transmute(string)s[i+2:];
-            return parsed_header{s1, s2};
+
+    while i + 1 < len(s^) {
+        if s^[i] == 13 && s^[i + 1] == 10 {
+            result := transmute(string)(s^[:i]);
+            s^ = transmute(string)(s^[i + 2:]);
+            return result;
         }
+
         i += 1;
     }
-    return parsed_header{"", ""};
+
+    return "";
 }
+
+
+// Parses a header in the form "Name: Value".
+fn http_parse_header(s: string): ParsedHeader {
+    i := 0;
+
+    while i < len(s) {
+        if s[i] == (":")[0] {
+            key := transmute(string)(s[:i]);
+
+            value_start := i + 1;
+            if value_start < len(s) && s[value_start] == 32 {
+                value_start += 1;
+            }
+
+            value := transmute(string)(s[value_start:]);
+
+            return ParsedHeader{key, value};
+        }
+
+        i += 1;
+    }
+
+    return ParsedHeader{"", ""};
+}
+
+
 fn main(): i32 {
-    count := 0;
-    all_paths := [1024]string{};
-    all_handlers := [1024]fn(r: Request, w: ResponseWriter): []byte{};
+    paths := [1024]string{};
+    handlers := [1024]fn(r: Request, w: ResponseWriter): []byte{};
+
+    handler_count := 0;
+
     listener := tcp_listen(1234, 10);
     if listener.fd < 0 {
-        println("failed to listen in tcp_listen.");
+        println("Failed to listen on port 1234.");
         return -1;
     }
-    all_paths[0] = "/";
-    all_paths[1] = "/i";
-    all_handlers[0] = fn(r: Request, w: ResponseWriter): []byte {
-        v := "";
-        if !map_get_m(r.headers, "User-Agent", &v) {
-            println("Failed to get user agent.");
-        } else {
-            // println("from", v);
+
+
+    // GET /
+    paths[0] = "/";
+    handlers[0] = fn(r: Request, w: ResponseWriter): []byte {
+        value := "";
+
+        if !map_get_m(r.headers, "User-Agent", &value) {
+            println("Failed to get User-Agent header.");
         }
-        if map_get_m(r.headers, "Content-Type", &v) {
-            if stringcmp(v, "application/json") {
-                println("JSON:", transmute(string)r.body);
-                j := JsonValue{0, "", 0, 0};
-                if !json_parse(transmute(string)r.body, &j, r.a) {
-                    println("Failed to parse json.");
-                    out := make_http_response( ("invalid json")[:],
-                        status = 400, a = r.a, content_type = "text/html; charset=utf-8");
-                    return out;
+
+        if map_get_m(r.headers, "Content-Type", &value) {
+            if stringcmp(value, "application/json") {
+                println("JSON:", transmute(string)(r.body));
+
+                json := JsonValue{0, "", 0, 0};
+
+                if !json_parse(transmute(string)(r.body), &json, r.a) {
+                    println("Failed to parse JSON.");
+
+                    return make_http_response(
+                        ("Invalid JSON")[:],
+                        status = 400,
+                        a = r.a,
+                        content_type = "text/plain; charset=utf-8",
+                    );
                 }
-                if !map_get_m(j.obj^, "value", &j) {
-                    println("failed to get value");
-                    out := make_http_response( ("missing vlaue")[:],
-                        status = 400, a = r.a, content_type = "text/html; charset=utf-8");
-                    return out;
+
+                if !map_get_m(json.obj^, "value", &json) {
+                    println("Failed to get 'value' from JSON.");
+
+                    return make_http_response(
+                        ("Missing value")[:],
+                        status = 400,
+                        a = r.a,
+                        content_type = "text/plain; charset=utf-8",
+                    );
                 }
-                println("Value:", j.num);
+
+                println("Value:", json.num);
             }
         }
-        out := make_http_response(
+
+        return make_http_response(
             ("<!DOCTYPE html><html><head></head><body><h1>Hello, World!</h1><img src=\"/i\" /></body></html>")[:],
             status = 200,
             a = r.a,
-            content_type = "text/html; charset=utf-8");
-        return out;
+            content_type = "text/html; charset=utf-8",
+        );
     };
-    all_handlers[1] = fn(r: Request, w: ResponseWriter): []byte {
-        img := open_file("./apple.png", r.a);
-        if len(img) == 0 {
-            println("Failed to open favicon");
-            out := make_http_response( ("failed to open favicon")[:], status = 500,
-             a = r.a, content_type = "text/plain; charset=utf-8");
-            return out;
+
+    handler_count += 1;
+
+
+    // GET /i
+    paths[1] = "/i";
+    handlers[1] = fn(r: Request, w: ResponseWriter): []byte {
+        image := open_file("./apple.png", r.a);
+
+        if len(image) == 0 {
+            println("Failed to open image: ./apple.png");
+
+            return make_http_response(
+                ("Failed to open image")[:],
+                status = 500,
+                a = r.a,
+                content_type = "text/plain; charset=utf-8",
+            );
         }
-        out := make_http_response( img, status = 200,
-                a = r.a, content_type = "image/png");
-        return out;
+
+        return make_http_response(
+            image,
+            status = 200,
+            a = r.a,
+            content_type = "image/png",
+        );
     };
-    count += 2;
-    
+
+    handler_count += 1;
+
+
     data := [4096]byte{};
-    println("Starting listening");
-    make_http_response(("")[:], status=123);
+
+    println("Listening on port 1234.");
+
     while true {
         client := tcp_accept(listener);
+
         n := tcp_recv(client, data[:]);
-        if n < 0 {
-            println("failed to receive from client.");
-            return -1;
+        if n <= 0 {
+            println("Failed to receive request from client.");
+            tcp_shutdown(client, SHUT_RDWR);
+            tcp_close(client);
+            continue;
         }
-        request := transmute(string)data[:n];
+
+        request := transmute(string)(data[:n]);
         whole_request := request;
 
-        header := http_request_next_line(&request);
-        if len(header) == 0 {
-            println("Invalid header for request:", whole_request);
-            return -1;
-        }
-        rest := header;
 
-        request_type := http_take_until(&rest, 32);
-        if len(request_type) == 0 {
-            println("Invalid header (request type) for request:", whole_request);
-            return -1;
+        // Parse the request line.
+        request_line := http_request_next_line(&request);
+
+        if len(request_line) == 0 {
+            println("Invalid request line:", whole_request);
+            tcp_shutdown(client, SHUT_RDWR);
+            tcp_close(client);
+            continue;
         }
 
-        path := http_take_until(&rest, 32);
-        if len(path) == 0 {
-            println("Invalid header (path) for request:", whole_request);
-            return -1;
+        request_parts := request_line;
+
+        request_type := http_take_until(&request_parts, 32);
+        path := http_take_until(&request_parts, 32);
+        version := http_take_until(&request_parts, 32);
+
+        if len(request_type) == 0 ||
+           len(path) == 0 ||
+           len(version) == 0 {
+            println("Malformed request line:", whole_request);
+            tcp_shutdown(client, SHUT_RDWR);
+            tcp_close(client);
+            continue;
         }
 
-        version := http_take_until(&rest, 32);
-        if len(version) == 0 {
-            println("Invalid header (version) for request:", whole_request);
-            return -1;
-        }
 
-        // println("Request type:      ", request_type, len(request_type));
-        // println("Request path:      ", path, len(path));
-        // println("Request version:   ", version, len(version));
+        // Allocate memory for this request.
+        arena := arena_make(1024 * 1024 * 16);
 
-        // request arena
-        arena := arena_make(1024*1024*16);
-        headers := map_make(128, "", "", hash_str, eq_str, arena_allocator(&arena));
+        headers := map_make(
+            128,
+            "",
+            "",
+            hash_str,
+            eq_str,
+            arena_allocator(&arena),
+        );
+
+
+        // Parse headers until the empty line separating headers and body.
         while true {
-            header1 := http_request_next_line(&request);
-            if len(header1) == 0 { break; }
-            parsed := http_parse_header(header1);
-            map_put(&headers, parsed.k, parsed.v);
-        }
-        body := request[:]; // should be rest as last line was \r\n
+            header_line := http_request_next_line(&request);
 
-
-        i := 0;
-        handled := false;
-        while i < count && !handled {
-            if stringcmp(path, all_paths[i]) {
-                out := all_handlers[i](Request{ headers=headers, kind=request_type, body=body,
-                    path=path, a=arena_allocator(&arena) }, ResponseWriter{});
-                handled = true;
-                tcp_send(client, out);
+            if len(header_line) == 0 {
                 break;
             }
-            i+= 1;
+
+            parsed := http_parse_header(header_line);
+
+            if len(parsed.k) == 0 {
+                println("Malformed header:", header_line);
+                continue;
+            }
+
+            map_put(&headers, parsed.k, parsed.v);
         }
+
+        body := request[:];
+
+
+        // Find and execute the matching handler.
+        handled := false;
+        i := 0;
+
+        while i < handler_count && !handled {
+            if stringcmp(path, paths[i]) {
+                response := handlers[i](
+                    Request{
+                        headers = headers,
+                        kind = request_type,
+                        body = body,
+                        path = path,
+                        a = arena_allocator(&arena),
+                    },
+                    ResponseWriter{},
+                );
+
+                tcp_send(client, response);
+                handled = true;
+                break;
+            }
+
+            i += 1;
+        }
+
+
+        // Return 404 when no route matches.
         if !handled {
-            println("no handlers for path:", path);
-            r := make_http_response(("invalid request")[:], status=404);
-            tcp_send(client, r);
+            println("No handler registered for path:", path);
+
+            response := make_http_response(
+                ("Not Found")[:],
+                status = 404,
+                a = arena_allocator(&arena),
+                content_type = "text/plain; charset=utf-8",
+            );
+
+            tcp_send(client, response);
         }
+
+
         arena_destroy(&arena);
+
         tcp_shutdown(client, SHUT_RDWR);
         tcp_close(client);
-
     }
+
     tcp_close(listener);
 
     return 0;
