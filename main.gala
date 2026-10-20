@@ -21,10 +21,7 @@ fn slice_from_ptr(p: rawptr, size: u64): []void {
 
 
 fn stringcmp(a: string, b: string): bool {
-    if len(a) != len(b) {
-        return false;
-    }
-
+    if len(a) != len(b) { return false; }
     i := 0;
     while i < len(a) {
         if a[i] != b[i] {
@@ -32,27 +29,17 @@ fn stringcmp(a: string, b: string): bool {
         }
         i += 1;
     }
-
     return true;
 }
 
 
-struct Request {
-    headers: Map(string, string),
+struct HttpRequest {
+    headers: ^Map(string, string),
     path: string,
     kind: string,
     body: []byte,
     a: Allocator,
 }
-
-struct ResponseWriter {
-}
-
-struct HttpServer {
-    paths: []string,
-    handlers: []fn(r: Request, w: ResponseWriter): []byte,
-}
-
 
 struct ParsedHeader {
     k, v: string,
@@ -100,6 +87,121 @@ fn http_request_next_line(s: ^string): string {
 }
 
 
+struct HttpServer {
+    port: u16,
+    handlers: Map(string, RequestHandler),
+}
+
+fn http_parse_request(data: []byte, r: ^HttpRequest, a: Allocator): bool {
+    request := transmute(string)data;
+    whole_request := request;
+
+    // Parse the request line.
+    request_line := http_request_next_line(&request);
+
+    if len(request_line) == 0 {
+        println("Invalid request line:", whole_request);
+        return false;
+    }
+
+    request_parts := request_line;
+
+    request_type := http_take_until(&request_parts, 32);
+    path := http_take_until(&request_parts, 32);
+    version := http_take_until(&request_parts, 32);
+
+    if len(request_type) == 0 || len(path) == 0 || len(version) == 0 {
+        println("Malformed request line:", whole_request);
+        return false;
+    }
+
+
+    headers := cast(^Map(string,string))alloc(size_of(Map(string, string)), a=a);
+    headers^ = map_make( 128, "", "", hash_str, eq_str, a);
+
+
+    // Parse headers until the empty line separating headers and body.
+    while true {
+        header_line := http_request_next_line(&request);
+
+        if len(header_line) == 0 {
+            break;
+        }
+
+        parsed := http_parse_header(header_line);
+
+        if len(parsed.k) == 0 {
+            println("Malformed header:", header_line);
+            return false;
+        }
+
+        map_put(headers, parsed.k, parsed.v);
+    }
+    body := request[:]; // rest of request
+    r^ = HttpRequest{ headers=headers, path=path, kind=request_type, body=body, a=a, };
+    return true;
+}
+fn http_serve(s: ^HttpServer): i32 {
+    listener := tcp_listen(1234, 10);
+    if listener.fd < 0 {
+        println("Failed to listen on port 1234.");
+        return -1;
+    }
+
+    data := [1024*8]byte{};
+
+    println("Listening on port 1234.");
+    while true {
+        client := tcp_accept(listener);
+
+        n := tcp_recv(client, data[:]);
+        if n <= 0 {
+            println("Failed to receive request from client.");
+            tcp_shutdown(client, SHUT_RDWR);
+            tcp_close(client);
+            continue;
+        }
+
+        // Allocate memory for this request.
+        arena := arena_make(1024 * 1024 * 16);
+        allocator := arena_allocator(&arena);
+        request := HttpRequest{ headers = 0, path = "", kind = "", body = ("")[:], a = allocator, };
+        if !http_parse_request(data[:], &request, allocator) {
+            println("Failed to parse http request.");
+            arena_destroy(&arena);
+
+            tcp_shutdown(client, SHUT_RDWR);
+            tcp_close(client);
+            continue;
+        }
+
+
+        f: RequestHandler = fn(r: HttpRequest):[]byte { return ("")[:]; };
+        if !map_get(&s^.handlers, request.path, &f) {
+            println("No handler registered for path:", request.path);
+
+            response := make_http_response(
+                ("Not Found")[:],
+                status = 404,
+                a = arena_allocator(&arena),
+                content_type = "text/plain; charset=utf-8",
+            );
+            tcp_send(client, response);
+            
+        } else {
+            r := f(request);
+            tcp_send(client, r);
+        }
+
+        arena_destroy(&arena);
+
+        tcp_shutdown(client, SHUT_RDWR);
+        tcp_close(client);
+    }
+
+    tcp_close(listener);
+    return 0;
+}
 // Parses a header in the form "Name: Value".
 fn http_parse_header(s: string): ParsedHeader {
     i := 0;
@@ -124,30 +226,17 @@ fn http_parse_header(s: string): ParsedHeader {
     return ParsedHeader{"", ""};
 }
 
+alias RequestHandler = fn(r: HttpRequest): []byte;
 
 fn main(): i32 {
-    paths := [1024]string{};
-    handlers := [1024]fn(r: Request, w: ResponseWriter): []byte{};
-
-    handler_count := 0;
-
-    listener := tcp_listen(1234, 10);
-    if listener.fd < 0 {
-        println("Failed to listen on port 1234.");
-        return -1;
-    }
-
-
-    // GET /
-    paths[0] = "/";
-    handlers[0] = fn(r: Request, w: ResponseWriter): []byte {
+    f_home := fn(r: HttpRequest): []byte {
         value := "";
 
-        if !map_get_m(r.headers, "User-Agent", &value) {
+        if !map_get(r.headers, "User-Agent", &value) {
             println("Failed to get User-Agent header.");
         }
 
-        if map_get_m(r.headers, "Content-Type", &value) {
+        if map_get(r.headers, "Content-Type", &value) {
             if stringcmp(value, "application/json") {
                 println("JSON:", transmute(string)(r.body));
 
@@ -187,12 +276,7 @@ fn main(): i32 {
         );
     };
 
-    handler_count += 1;
-
-
-    // GET /i
-    paths[1] = "/i";
-    handlers[1] = fn(r: Request, w: ResponseWriter): []byte {
+    f_i := fn(r: HttpRequest): []byte {
         image := open_file("./apple.png", r.a);
 
         if len(image) == 0 {
@@ -213,137 +297,9 @@ fn main(): i32 {
             content_type = "image/png",
         );
     };
-
-    handler_count += 1;
-
-
-    data := [4096]byte{};
-
-    println("Listening on port 1234.");
-
-    while true {
-        client := tcp_accept(listener);
-
-        n := tcp_recv(client, data[:]);
-        if n <= 0 {
-            println("Failed to receive request from client.");
-            tcp_shutdown(client, SHUT_RDWR);
-            tcp_close(client);
-            continue;
-        }
-
-        request := transmute(string)(data[:n]);
-        whole_request := request;
-
-
-        // Parse the request line.
-        request_line := http_request_next_line(&request);
-
-        if len(request_line) == 0 {
-            println("Invalid request line:", whole_request);
-            tcp_shutdown(client, SHUT_RDWR);
-            tcp_close(client);
-            continue;
-        }
-
-        request_parts := request_line;
-
-        request_type := http_take_until(&request_parts, 32);
-        path := http_take_until(&request_parts, 32);
-        version := http_take_until(&request_parts, 32);
-
-        if len(request_type) == 0 ||
-           len(path) == 0 ||
-           len(version) == 0 {
-            println("Malformed request line:", whole_request);
-            tcp_shutdown(client, SHUT_RDWR);
-            tcp_close(client);
-            continue;
-        }
-
-
-        // Allocate memory for this request.
-        arena := arena_make(1024 * 1024 * 16);
-
-        headers := map_make(
-            128,
-            "",
-            "",
-            hash_str,
-            eq_str,
-            arena_allocator(&arena),
-        );
-
-
-        // Parse headers until the empty line separating headers and body.
-        while true {
-            header_line := http_request_next_line(&request);
-
-            if len(header_line) == 0 {
-                break;
-            }
-
-            parsed := http_parse_header(header_line);
-
-            if len(parsed.k) == 0 {
-                println("Malformed header:", header_line);
-                continue;
-            }
-
-            map_put(&headers, parsed.k, parsed.v);
-        }
-
-        body := request[:];
-
-
-        // Find and execute the matching handler.
-        handled := false;
-        i := 0;
-
-        while i < handler_count && !handled {
-            if stringcmp(path, paths[i]) {
-                response := handlers[i](
-                    Request{
-                        headers = headers,
-                        kind = request_type,
-                        body = body,
-                        path = path,
-                        a = arena_allocator(&arena),
-                    },
-                    ResponseWriter{},
-                );
-
-                tcp_send(client, response);
-                handled = true;
-                break;
-            }
-
-            i += 1;
-        }
-
-
-        // Return 404 when no route matches.
-        if !handled {
-            println("No handler registered for path:", path);
-
-            response := make_http_response(
-                ("Not Found")[:],
-                status = 404,
-                a = arena_allocator(&arena),
-                content_type = "text/plain; charset=utf-8",
-            );
-
-            tcp_send(client, response);
-        }
-
-
-        arena_destroy(&arena);
-
-        tcp_shutdown(client, SHUT_RDWR);
-        tcp_close(client);
-    }
-
-    tcp_close(listener);
-
-    return 0;
+    handlers := map_make(10, "", f_i, hash_str, eq_str, );
+    map_put(&handlers, "/", f_home);
+    map_put(&handlers, "/i", f_i);
+    s := HttpServer{port=1234, handlers=handlers};
+    return http_serve(&s);
 }
