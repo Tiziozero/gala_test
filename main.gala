@@ -9,7 +9,7 @@ import "core/io.gala";
 import "core/json.gala";
 import "./http_response.gala";
 
-
+running: bool = true;
 struct VoidSlice {
     p: rawptr,
     size: u64,
@@ -141,17 +141,125 @@ fn http_parse_request(data: []byte, r: ^HttpRequest, a: Allocator): bool {
     r^ = HttpRequest{ headers=headers, path=path, kind=request_type, body=body, a=a, };
     return true;
 }
+// Parses a header in the form "Name: Value".
+fn http_parse_header(s: string): ParsedHeader {
+    i := 0;
+
+    while i < len(s) {
+        if s[i] == (":")[0] {
+            key := transmute(string)(s[:i]);
+
+            value_start := i + 1;
+            if value_start < len(s) && s[value_start] == 32 {
+                value_start += 1;
+            }
+
+            value := transmute(string)(s[value_start:]);
+
+            return ParsedHeader{key, value};
+        }
+
+        i += 1;
+    }
+
+    return ParsedHeader{"", ""};
+}
+
+// Register a route.
+fn http_register_handler(
+    handlers: ^Map(string, RequestHandler),
+    path: string,
+    handler: RequestHandler,
+) {
+    map_put(handlers, path, handler);
+}
+
+
+// Parse the request body as JSON.
+// Returns false if parsing fails.
+fn http_parse_json_body(r: HttpRequest, out: ^JsonValue): bool {
+    return json_parse(transmute(string)(r.body), out, r.a);
+}
+
+
+// Return a text response.
+fn http_provide_text(
+    body: string,
+    status: i64 = 200,
+    a: Allocator = base_allocator,
+): []byte {
+    return make_http_response(
+        transmute([]byte)(body),
+        status = status,
+        a = a,
+        content_type = "text/plain; charset=utf-8",
+    );
+}
+
+
+// Return an HTML response.
+fn http_provide_html(
+    body: string,
+    status: i64 = 200,
+    a: Allocator = base_allocator,
+): []byte {
+    return make_http_response(
+        transmute([]byte)(body),
+        status = status,
+        a = a,
+        content_type = "text/html; charset=utf-8",
+    );
+}
+
+
+// Read a file and return it as a response.
+// An empty file is treated as a read failure, matching the existing code.
+fn http_provide_file(
+    path: string,
+    content_type: string,
+    a: Allocator,
+): []byte {
+    file := open_file(path, a);
+
+    if len(file) == 0 {
+        println("Failed to open file:", path);
+
+        return http_provide_text(
+            "Failed to open file",
+            status = 500,
+            a = a,
+        );
+    }
+
+    return make_http_response(
+        file,
+        status = 200,
+        a = a,
+        content_type = content_type,
+    );
+}
+
+
+// Convenience wrapper for images.
+fn http_provide_image(path: string, content_type: string, a: Allocator): []byte {
+    return http_provide_file(path, content_type, a);
+}
+
+
+alias RequestHandler = fn(r: HttpRequest): []byte;
+
+
 fn http_serve(s: ^HttpServer): i32 {
-    listener := tcp_listen(1234, 10);
+    listener := tcp_listen(s^.port, 10);
     if listener.fd < 0 {
-        println("Failed to listen on port 1234.");
+        println("Failed to listen on port", s^.port);
         return -1;
     }
 
     data := [1024*8]byte{};
 
-    println("Listening on port 1234.");
-    while true {
+    println("Listening on port", s^.port);
+    while running {
         client := tcp_accept(listener);
 
         n := tcp_recv(client, data[:]);
@@ -187,7 +295,7 @@ fn http_serve(s: ^HttpServer): i32 {
                 content_type = "text/plain; charset=utf-8",
             );
             tcp_send(client, response);
-            
+
         } else {
             r := f(request);
             tcp_send(client, r);
@@ -199,34 +307,11 @@ fn http_serve(s: ^HttpServer): i32 {
         tcp_close(client);
     }
 
+    println("Shutting down.");
     tcp_close(listener);
     return 0;
 }
-// Parses a header in the form "Name: Value".
-fn http_parse_header(s: string): ParsedHeader {
-    i := 0;
 
-    while i < len(s) {
-        if s[i] == (":")[0] {
-            key := transmute(string)(s[:i]);
-
-            value_start := i + 1;
-            if value_start < len(s) && s[value_start] == 32 {
-                value_start += 1;
-            }
-
-            value := transmute(string)(s[value_start:]);
-
-            return ParsedHeader{key, value};
-        }
-
-        i += 1;
-    }
-
-    return ParsedHeader{"", ""};
-}
-
-alias RequestHandler = fn(r: HttpRequest): []byte;
 
 fn main(): i32 {
     f_home := fn(r: HttpRequest): []byte {
@@ -238,29 +323,21 @@ fn main(): i32 {
 
         if map_get(r.headers, "Content-Type", &value) {
             if stringcmp(value, "application/json") {
-                println("JSON:", transmute(string)(r.body));
-
                 json := JsonValue{0, "", 0, 0};
 
-                if !json_parse(transmute(string)(r.body), &json, r.a) {
-                    println("Failed to parse JSON.");
-
-                    return make_http_response(
-                        ("Invalid JSON")[:],
+                if !http_parse_json_body(r, &json) {
+                    return http_provide_text(
+                        "Invalid JSON",
                         status = 400,
                         a = r.a,
-                        content_type = "text/plain; charset=utf-8",
                     );
                 }
 
                 if !map_get_m(json.obj^, "value", &json) {
-                    println("Failed to get 'value' from JSON.");
-
-                    return make_http_response(
-                        ("Missing value")[:],
+                    return http_provide_text(
+                        "Missing value",
                         status = 400,
                         a = r.a,
-                        content_type = "text/plain; charset=utf-8",
                     );
                 }
 
@@ -268,38 +345,38 @@ fn main(): i32 {
             }
         }
 
-        return make_http_response(
-            ("<!DOCTYPE html><html><head></head><body><h1>Hello, World!</h1><img src=\"/i\" /></body></html>")[:],
-            status = 200,
+        return http_provide_html(
+            "<!DOCTYPE html><html><head></head><body><h1>Hello, World!</h1><img src=\"/i\" /></body></html>",
             a = r.a,
-            content_type = "text/html; charset=utf-8",
         );
     };
 
     f_i := fn(r: HttpRequest): []byte {
-        image := open_file("./apple.png", r.a);
-
-        if len(image) == 0 {
-            println("Failed to open image: ./apple.png");
-
-            return make_http_response(
-                ("Failed to open image")[:],
-                status = 500,
-                a = r.a,
-                content_type = "text/plain; charset=utf-8",
-            );
-        }
-
-        return make_http_response(
-            image,
-            status = 200,
-            a = r.a,
-            content_type = "image/png",
+        return http_provide_image(
+            "./apple.png",
+            "image/png",
+            r.a,
         );
     };
-    handlers := map_make::<string,RequestHandler>(10, hash_str, eq_str, );
-    map_put(&handlers, "/", f_home);
-    map_put(&handlers, "/i", f_i);
-    s := HttpServer{port=1234, handlers=handlers};
-    return http_serve(&s);
+
+    // Debug only: remove before exposing the server publicly.
+    f_quit := fn(r: HttpRequest): []byte {
+        running = false;
+        return http_provide_text("Shutting down", a = r.a);
+    };
+
+    handlers := map_make::<string, RequestHandler>(
+        10,
+        hash_str,
+        eq_str,
+    );
+
+    http_register_handler(&handlers, "/", f_home);
+    http_register_handler(&handlers, "/i", f_i);
+    http_register_handler(&handlers, "/quit", f_quit);
+
+    s := HttpServer{port = 25565, handlers = handlers};
+    c := http_serve(&s);
+    map_free(&handlers);
+    return c;
 }
