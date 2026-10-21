@@ -2,6 +2,7 @@
 
 import "core/core.gala";
 import "core/net.gala";
+import "core/tls.gala";
 import "core/mem.gala";
 import "core/cfunctions.gala";
 import "core/map.gala";
@@ -250,21 +251,42 @@ alias RequestHandler = fn(r: HttpRequest): []byte;
 
 
 fn http_serve(s: ^HttpServer): i32 {
+    // A client hanging up mid-write must not kill the server.
+    signal(SIGPIPE, SIG_IGN);
+
     listener := tcp_listen(s^.port, 10);
     if listener.fd < 0 {
         println("Failed to listen on port", s^.port);
         return -1;
     }
 
+    // Shared TLS context: certificate + private key, created once.
+    tls_ctx := tls_make_context("tls/cert.pem", "tls/key.pem");
+    if tls_ctx == 0 {
+        println("Failed to set up TLS (check cert.pem / key.pem).");
+        tcp_close(listener);
+        return -1;
+    }
+
     data := [1024*8]byte{};
 
-    println("Listening on port", s^.port);
+    println("Listening (https) on port", s^.port);
     while running {
         client := tcp_accept(listener);
 
-        n := tcp_recv(client, data[:]);
+        // TLS handshake on the accepted socket.
+        conn := tls_accept(tls_ctx, client);
+        if conn.ssl == 0 {
+            println("TLS handshake failed.");
+            tcp_shutdown(client, SHUT_RDWR);
+            tcp_close(client);
+            continue;
+        }
+
+        n := tls_recv(conn, data[:]);
         if n <= 0 {
             println("Failed to receive request from client.");
+            tls_close(conn);
             tcp_shutdown(client, SHUT_RDWR);
             tcp_close(client);
             continue;
@@ -274,10 +296,13 @@ fn http_serve(s: ^HttpServer): i32 {
         arena := arena_make(1024 * 1024 * 16);
         allocator := arena_allocator(&arena);
         request := HttpRequest{ headers = 0, path = "", kind = "", body = ("")[:], a = allocator, };
-        if !http_parse_request(data[:], &request, allocator) {
+
+        // Only parse the n bytes actually received, not the whole 8 KB buffer.
+        if !http_parse_request(data[:n], &request, allocator) {
             println("Failed to parse http request.");
             arena_destroy(&arena);
 
+            tls_close(conn);
             tcp_shutdown(client, SHUT_RDWR);
             tcp_close(client);
             continue;
@@ -294,20 +319,22 @@ fn http_serve(s: ^HttpServer): i32 {
                 a = arena_allocator(&arena),
                 content_type = "text/plain; charset=utf-8",
             );
-            tcp_send(client, response);
+            tls_send(conn, response);
 
         } else {
             r := f(request);
-            tcp_send(client, r);
+            tls_send(conn, r);
         }
 
         arena_destroy(&arena);
 
+        tls_close(conn);
         tcp_shutdown(client, SHUT_RDWR);
         tcp_close(client);
     }
 
     println("Shutting down.");
+    SSL_CTX_free(tls_ctx);
     tcp_close(listener);
     return 0;
 }
