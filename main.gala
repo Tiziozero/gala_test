@@ -117,7 +117,7 @@ fn http_parse_request(data: []byte, r: ^HttpRequest, a: Allocator): bool {
 
 
     headers := cast(^Map(string,string))alloc(size_of(Map(string, string)), a=a);
-    headers^ = map_make( 128, "", "", hash_str, eq_str, a);
+    headers^ = map_make::<string,string>(128, hash_str, eq_str, a);
 
 
     // Parse headers until the empty line separating headers and body.
@@ -297,7 +297,7 @@ fn main(): i32 {
             content_type = "image/png",
         );
     };
-    handlers := map_make(10, "", f_i, hash_str, eq_str, );
+    handlers := map_make::<string,RequestHandler>(10, hash_str, eq_str, );
     map_put(&handlers, "/", f_home);
     map_put(&handlers, "/i", f_i);
     s := HttpServer{port=1234, handlers=handlers};
