@@ -6,7 +6,7 @@ import os
 debug = False
 
 p = subprocess.run(
-    ["galac", "-o", "program", "main.gala", "-d"],
+    ["galac", "-o", "program", "main.gala"],
     capture_output=True,
     text=True
 )

@@ -139,7 +139,7 @@ fn http_parse_request(data: []byte, r: ^HttpRequest, a: Allocator): bool {
         map_put(headers, parsed.k, parsed.v);
     }
     body := request[:]; // rest of request
-    r^ = HttpRequest{ headers=headers, path=path, kind=request_type, body=body, a=a, };
+    r^ = HttpRequest{ headers=headers, path=path, kind=request_type, body=transmute([]byte)body, a=a, };
     return true;
 }
 // Parses a header in the form "Name: Value".
@@ -295,7 +295,7 @@ fn http_serve(s: ^HttpServer): i32 {
         // Allocate memory for this request.
         arena := arena_make(1024 * 1024 * 16);
         allocator := arena_allocator(&arena);
-        request := HttpRequest{ headers = 0, path = "", kind = "", body = ("")[:], a = allocator, };
+        request := HttpRequest{ headers = 0, path = "", kind = "", body = ([0]byte{})[:], a = allocator, };
 
         // Only parse the n bytes actually received, not the whole 8 KB buffer.
         if !http_parse_request(data[:n], &request, allocator) {
@@ -309,12 +309,12 @@ fn http_serve(s: ^HttpServer): i32 {
         }
 
 
-        f: RequestHandler = fn(r: HttpRequest):[]byte { return ("")[:]; };
+        f: RequestHandler = fn(r: HttpRequest):[]byte { return ([0]byte{})[:]; };
         if !map_get(&s^.handlers, request.path, &f) {
             println("No handler registered for path:", request.path);
 
             response := make_http_response(
-                ("Not Found")[:],
+                transmute([]byte)("Not Found")[:],
                 status = 404,
                 a = arena_allocator(&arena),
                 content_type = "text/plain; charset=utf-8",
