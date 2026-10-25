@@ -8,6 +8,7 @@ import "core/cfunctions.gala";
 import "core/map.gala";
 import "core/io.gala";
 import "core/json.gala";
+import "core/threads.gala";
 import "./http_response.gala";
 
 running: bool = true;
@@ -250,6 +251,68 @@ fn http_provide_image(path: string, content_type: string, a: Allocator): []byte 
 alias RequestHandler = fn(r: HttpRequest): []byte;
 
 
+fn handle_connection(client_data: ^struct{ s: ^HttpServer, client: TcpSocket, conn: TlsConn}) {
+    println("spawn");
+
+    data := [1024*8]byte{};
+    conn := client_data^.conn;
+    client := client_data^.client;
+    s := client_data^.s;
+    n := tls_recv(conn, data[:]);
+    if n <= 0 {
+        println("Failed to receive request from client.");
+        tls_close(conn);
+        tcp_shutdown(client, SHUT_RDWR);
+        tcp_close(client);
+        return;
+    }
+
+    // Allocate memory for this request.
+    arena := arena_make(1024 * 1024 * 16);
+    allocator := arena_allocator(&arena);
+    request := HttpRequest{ headers = 0, path = "", kind = "", body = ([0]byte{})[:], a = allocator, };
+
+    // Only parse the n bytes actually received, not the whole 8 KB buffer.
+    if !http_parse_request(data[:n], &request, allocator) {
+        println("Failed to parse http request.");
+        arena_destroy(&arena);
+
+        tls_close(conn);
+        tcp_shutdown(client, SHUT_RDWR);
+        tcp_close(client);
+        return;
+    }
+
+
+    f: RequestHandler = fn(r: HttpRequest):[]byte { return ([0]byte{})[:]; };
+    if !map_get(&s^.handlers, request.path, &f) {
+        println("No handler registered for path:", request.path);
+
+        response := make_http_response(
+            transmute([]byte)("Not Found")[:],
+            status = 404,
+            a = arena_allocator(&arena),
+            content_type = "text/plain; charset=utf-8",
+        );
+        tls_send(conn, response);
+
+    } else {
+        r := f(request);
+        tls_send(conn, r);
+    }
+
+    arena_destroy(&arena);
+
+    tls_close(conn);
+    tcp_shutdown(client, SHUT_RDWR);
+    tcp_close(client);
+    sleep_ms(1000*3);
+    free(cast(rawptr)client_data);
+
+
+    println("end");
+}
+
 fn http_serve(s: ^HttpServer): i32 {
     // A client hanging up mid-write must not kill the server.
     signal(SIGPIPE, SIG_IGN);
@@ -268,7 +331,6 @@ fn http_serve(s: ^HttpServer): i32 {
         return -1;
     }
 
-    data := [1024*8]byte{};
 
     println("Listening (https) on port", s^.port);
     while running {
@@ -283,54 +345,12 @@ fn http_serve(s: ^HttpServer): i32 {
             continue;
         }
 
-        n := tls_recv(conn, data[:]);
-        if n <= 0 {
-            println("Failed to receive request from client.");
-            tls_close(conn);
-            tcp_shutdown(client, SHUT_RDWR);
-            tcp_close(client);
-            continue;
-        }
-
-        // Allocate memory for this request.
-        arena := arena_make(1024 * 1024 * 16);
-        allocator := arena_allocator(&arena);
-        request := HttpRequest{ headers = 0, path = "", kind = "", body = ([0]byte{})[:], a = allocator, };
-
-        // Only parse the n bytes actually received, not the whole 8 KB buffer.
-        if !http_parse_request(data[:n], &request, allocator) {
-            println("Failed to parse http request.");
-            arena_destroy(&arena);
-
-            tls_close(conn);
-            tcp_shutdown(client, SHUT_RDWR);
-            tcp_close(client);
-            continue;
-        }
-
-
-        f: RequestHandler = fn(r: HttpRequest):[]byte { return ([0]byte{})[:]; };
-        if !map_get(&s^.handlers, request.path, &f) {
-            println("No handler registered for path:", request.path);
-
-            response := make_http_response(
-                transmute([]byte)("Not Found")[:],
-                status = 404,
-                a = arena_allocator(&arena),
-                content_type = "text/plain; charset=utf-8",
-            );
-            tls_send(conn, response);
-
-        } else {
-            r := f(request);
-            tls_send(conn, r);
-        }
-
-        arena_destroy(&arena);
-
-        tls_close(conn);
-        tcp_shutdown(client, SHUT_RDWR);
-        tcp_close(client);
+        c := new::<struct{ s: ^HttpServer, client: TcpSocket, conn: TlsConn}>();
+        c^.client = client;
+        c^.conn = conn;
+        c^.s = s;
+        th := thread_spawn(handle_connection, c);
+        thread_detach(th);
     }
 
     println("Shutting down.");
@@ -389,6 +409,7 @@ fn main(): i32 {
     // Debug only: remove before exposing the server publicly.
     f_quit := fn(r: HttpRequest): []byte {
         running = false;
+        println("shutting down.");
         return http_provide_text("Shutting down", a = r.a);
     };
 
